@@ -42,6 +42,9 @@ ESP8266WebServer server(80);
 // Global timing variables
 unsigned long lastUpdateTime = 0;
 unsigned long lastBlinkTime = 0;
+// Auto restart variables (set to 6 hours here)
+unsigned long lastRestartTime = 0;
+const unsigned long restartInterval = 6UL * 60UL * 60UL * 1000UL; // 6 hours in ms
 
 // Pin configuration for two ultrasonic sensors
 #define TRIG_PIN_1  D5    // Example: D5 (GPIO14)
@@ -88,7 +91,7 @@ void setupTime() {
     delay(1000);
     retry++;
   }
-  if(retry >= 10){
+  if (retry >= 10) {
     Serial.println("Failed to obtain time");
   } else {
     Serial.println("Time synchronized");
@@ -156,7 +159,6 @@ void logMessage(String message) {
 int calculateMode(int readings[], int size) {
   int mode = readings[0];
   int maxCount = 0;
-
   for (int i = 0; i < size; i++) {
     int count = 0;
     for (int j = 0; j < size; j++) {
@@ -184,21 +186,22 @@ float getDistance(int trigPin, int echoPin) {
   return (duration * 0.0343 / 2);   // Convert duration to cm
 }
 
-
-// Calculate tank level as a percentage with multiple readings
+// Calculate tank level as a percentage using 5 readings and return the mode of valid readings
 int getTankLevel(int trigPin, int echoPin, int fullDistance, int emptyDistance) {
-  const int numReadings = 5; // Number of readings to take
-  int levelReadings[numReadings];
+  const int numSamples = 5;
+  int validReadings[numSamples];
+  int count = 0;
 
-  for (int i = 0; i < numReadings; i++) {
+  for (int i = 0; i < numSamples; i++) {
     float distance = getDistance(trigPin, echoPin);
-    if (distance == -1.0) return -1; // Return -1 if no valid reading
-    distance = constrain(distance, fullDistance, emptyDistance);
-    levelReadings[i] = map(distance, emptyDistance, fullDistance, 0, 100);
-    delay(50); // Small delay between readings
+    if (distance != -1.0) {
+      distance = constrain(distance, fullDistance, emptyDistance);
+      validReadings[count++] = map(distance, emptyDistance, fullDistance, 0, 100);
+    }
+    delay(200); // Small delay between readings
   }
-
-  return calculateMode(levelReadings, numReadings);
+  if (count == 0) return -1;
+  return calculateMode(validReadings, count);
 }
 
 // Send sensor data to remote API via HTTPS
@@ -216,10 +219,10 @@ void sendDataToApi(int tank1Level, int tank2Level) {
       int httpResponseCode = http.POST(postData);
       String response = http.getString();
       if (httpResponseCode < 200 || httpResponseCode >= 300) {
-        logMessage("API call failed. Retrying...");
+        logMessage("API call failed. Status Code: " + String(httpResponseCode) + ", Response: " + response);
+      } else {
+        logMessage("API call succeeded. Status Code: " + String(httpResponseCode));
       }
-      logMessage("Status Code: " + String(httpResponseCode));
-      logMessage("Response: " + response);
       http.end();
     } else {
       logMessage("[HTTP] Unable to connect");
@@ -270,9 +273,10 @@ void handleRoot() {
   html += "<button type='submit' class='btn btn-primary'>Update Settings</button>";
   html += "</div></div></form></div></div>";
   
-  html += "<a href='/log' class='btn btn-default'>View Log File</a></div>";
+  html += "<a href='/log' class='btn btn-default'>View Log File</a> ";
+  html += "<a href='/wifi' class='btn btn-info'>WiFi Status</a></div>";
   
-  // JavaScript for live readings update via AJAX every 5 seconds
+  // JavaScript for live readings update via AJAX every API interval
   html += "<script src='https://ajax.googleapis.com/ajax/libs/jquery/3.2.1/jquery.min.js'></script>";
   html += "<script>function fetchReadings() { $.getJSON('/readings', function(data) { $('#tank1').text(data.tank1 + '%'); $('#tank2').text(data.tank2 + '%'); }); }";
   html += "setInterval(fetchReadings, "+String(apiUpdateInterval)+"); fetchReadings();</script>";
@@ -329,6 +333,45 @@ void handleReadings() {
 }
 
 // ----------------------------------------------------------
+// WiFi Status and Reconnect Handlers
+// ----------------------------------------------------------
+void handleWifi() {
+  String html = "<!DOCTYPE html><html lang='en'><head>";
+  html += "<meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'>";
+  html += "<link rel='stylesheet' href='https://maxcdn.bootstrapcdn.com/bootstrap/3.3.7/css/bootstrap.min.css'>";
+  html += "<title>WiFi Status</title></head><body>";
+  html += "<div class='container'><h1>WiFi Status</h1>";
+  
+  // Check WiFi connection status
+  String status = (WiFi.status() == WL_CONNECTED) ? "Connected" : "Disconnected";
+  html += "<p><strong>WiFi Connection:</strong> " + status + "</p>";
+  
+  // Check Internet connectivity via DNS lookup
+  IPAddress remoteIP;
+  bool internet = WiFi.hostByName("google.com", remoteIP);
+  html += "<p><strong>Internet Connectivity:</strong> " + String(internet ? "Available" : "Not Available") + "</p>";
+  
+  html += "<form action='/forceWifi' method='GET'><button type='submit' class='btn btn-warning'>Force WiFi Reconnect</button></form>";
+  html += "<br><a href='/' class='btn btn-default'>Back</a></div></body></html>";
+  server.send(200, "text/html", html);
+}
+
+// Handler to force WiFi reconnect
+void handleForceWifi() {
+  logMessage("Forcing WiFi reconnect as per user request.");
+  WiFi.disconnect();
+  delay(500);
+  WiFiMulti.addAP(ssid, password);
+  // Wait briefly for reconnection
+  unsigned long start = millis();
+  while(WiFiMulti.run() != WL_CONNECTED && millis() - start < 5000) {
+    delay(200);
+  }
+  server.sendHeader("Location", "/wifi");
+  server.send(303);
+}
+
+// ----------------------------------------------------------
 // Setup and Loop
 // ----------------------------------------------------------
 void setup() {
@@ -336,7 +379,13 @@ void setup() {
   delay(1000);
   Serial.println("\n\nStarting ESP8266 Water Level Monitor...\n");
   
-  SPIFFS.begin();
+  // Initialize SPIFFS
+  if (!SPIFFS.begin()) {
+    Serial.println("SPIFFS Mount Failed");
+  }
+  
+  // Log restart event
+  logMessage("=== ESP Restarted ===");
   
   WiFi.mode(WIFI_STA);
   WiFiMulti.addAP(ssid, password);
@@ -352,20 +401,28 @@ void setup() {
   
   setupTime();
   
+  // Setup web server routes
   server.on("/", handleRoot);
   server.on("/update", handleUpdate);
   server.on("/log", handleLog);
   server.on("/readings", handleReadings);
+  server.on("/wifi", handleWifi);
+  server.on("/forceWifi", handleForceWifi);
   server.begin();
   Serial.println("Web server started.");
   
+  // Sensor pin setup
   pinMode(TRIG_PIN_1, OUTPUT);
   pinMode(ECHO_PIN_1, INPUT);
   pinMode(TRIG_PIN_2, OUTPUT);
   pinMode(ECHO_PIN_2, INPUT);
   
+  // LED setup
   pinMode(LED_BUILTIN, OUTPUT);
   digitalWrite(LED_BUILTIN, LOW);
+  
+  // Initialize restart timer
+  lastRestartTime = millis();
 }
 
 void loop() {
@@ -373,11 +430,13 @@ void loop() {
   
   server.handleClient();
   
+  // WiFi reconnection handling
   if (WiFiMulti.run() != WL_CONNECTED) {
     logMessage("WiFi disconnected. Attempting to reconnect...");
     delay(500);
   }
   
+  // API update block
   if (currentMillis - lastUpdateTime >= apiUpdateInterval) {
     int t1 = getTankLevel(TRIG_PIN_1, ECHO_PIN_1, tank1_full_distance, tank1_empty_distance);
     int t2 = getTankLevel(TRIG_PIN_2, ECHO_PIN_2, tank2_full_distance, tank2_empty_distance);
@@ -389,8 +448,16 @@ void loop() {
     lastUpdateTime = currentMillis;
   }
   
+  // LED blink for status
   if (currentMillis - lastBlinkTime >= 2000) {
     digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN));
     lastBlinkTime = currentMillis;
+  }
+  
+  // Auto-restart if restart interval exceeded
+  if (currentMillis - lastRestartTime >= restartInterval) {
+    logMessage("Restart interval reached. Restarting ESP...");
+    delay(100);  // Allow logs to flush
+    ESP.restart();
   }
 }
